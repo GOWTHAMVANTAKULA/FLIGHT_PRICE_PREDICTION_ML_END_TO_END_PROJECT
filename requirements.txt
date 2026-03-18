@@ -1,7 +1,9 @@
-flask
+streamlit
 numpy
 pandas
 scikit-learn
-matplotlib
-seaborn
 xgboost
+joblib
+psycopg2-binary  
+sqlalchemy        
+python-dotenv     

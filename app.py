@@ -1,153 +1,164 @@
-import pickle
-from flask import Flask, request, jsonify, render_template # Added render_template
+import streamlit as st
 import pandas as pd
+import joblib
 import numpy as np
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+import os
 from datetime import datetime
 
-app = Flask(__name__)
+# -------------------------------
+# Load environment variables
+# -------------------------------
+load_dotenv()
+DATABASE_URL = os.getenv("DATABASE_URL")
 
-# --- 1. Load the trained model and scaler ---
-try:
-    with open('xgboost_model.pkl', 'rb') as f:
-        model = pickle.load(f)
-    with open('scaler.pkl', 'rb') as f:
-        scaler = pickle.load(f)
-    print("Model and scaler loaded successfully!")
-except FileNotFoundError:
-    print("Error: 'xgboost_model.pkl' or 'scaler.pkl' not found. Make sure they are in the same directory.")
-    exit()
-except Exception as e:
-    print(f"Error loading model or scaler: {e}")
-    exit()
+if not DATABASE_URL:
+    st.error("❌ DATABASE_URL not found. Check your .env file.")
+    st.stop()
 
-# --- 2. Define the exact columns the model expects ---
-NUM_COLS_SCALED = ['time', 'distance', 'day', 'month', 'is_weekend', 'speed']
+# -------------------------------
+# PostgreSQL Connection (Render requires SSL)
+# -------------------------------
+engine = create_engine(DATABASE_URL + "?sslmode=require")
 
-FROM_COLS = [
-    'from_Brasilia (DF)', 'from_Campo Grande (MS)', 'from_Florianopolis (SC)',
-    'from_Natal (RN)', 'from_Recife (PE)', 'from_Rio de Janeiro (RJ)',
-    'from_Salvador (BH)', 'from_Sao Paulo (SP)'
-]
+# -------------------------------
+# Load Model Artifacts
+# -------------------------------
+model = joblib.load("xgb_flight_price_model.joblib")
+scaler = joblib.load("standard_scaler.joblib")
+feature_columns = joblib.load("feature_columns.joblib")
 
-TO_COLS = [
-    'to_Brasilia (DF)', 'to_Campo Grande (MS)', 'to_Florianopolis (SC)',
-    'to_Natal (RN)', 'to_Recife (PE)', 'to_Rio de Janeiro (RJ)',
-    'to_Salvador (BH)', 'to_Sao Paulo (SP)'
-]
+# -------------------------------
+# Streamlit UI
+# -------------------------------
+st.title("✈️ Flight Price Prediction App")
+st.write("Enter flight details to predict the ticket price.")
 
-FLIGHT_TYPE_COLS = ['flightType_firstClass', 'flightType_premium']
+# -------------------------------
+# User Inputs
+# -------------------------------
+from_city = st.selectbox("From City", [
+    "Brasilia (DF)", "Campo Grande (MS)", "Florianopolis (SC)",
+    "Natal (RN)", "Recife (PE)", "Rio de Janeiro (RJ)",
+    "Salvador (BH)", "Sao Paulo (SP)"
+])
 
-AGENCY_COLS = ['agency_FlyingDrops', 'agency_Rainbow']
+to_city = st.selectbox("To City", [
+    "Brasilia (DF)", "Campo Grande (MS)", "Florianopolis (SC)",
+    "Natal (RN)", "Recife (PE)", "Rio de Janeiro (RJ)",
+    "Salvador (BH)", "Sao Paulo (SP)"
+])
 
-EXPECTED_MODEL_COLUMNS = NUM_COLS_SCALED + FROM_COLS + TO_COLS + FLIGHT_TYPE_COLS + AGENCY_COLS
+flight_type = st.selectbox("Flight Type", ["economic", "firstClass", "premium"])
+agency = st.selectbox("Booking Agency", ["CloudFy", "FlyingDrops", "Rainbow"])
+time = st.number_input("Flight Time (hours)", min_value=1.0)
+distance = st.number_input("Distance (km)", min_value=1.0)
+date = st.date_input("Flight Date")
 
-# --- 3. Preprocessing function for new data from form ---
-def preprocess_input(form_data) -> pd.DataFrame:
-    """
-    Applies the same preprocessing steps to new input data from an HTML form.
-    """
-    # Prepare input dictionary for DataFrame creation
-    input_dict = {
-        'from': form_data.get('from'),
-        'to': form_data.get('to'),
-        'flightType': form_data.get('flightType'),
-        'time': float(form_data.get('time')),
-        'distance': float(form_data.get('distance')),
-        'agency': form_data.get('agency'),
-        'date': form_data.get('date') # Assuming 'MM/DD/YYYY' format from HTML input type="date"
-    }
+# -------------------------------
+# Validation
+# -------------------------------
+if from_city == to_city:
+    st.warning("⚠️ From City and To City cannot be the same.")
 
-    df_input = pd.DataFrame([input_dict])
+# -------------------------------
+# Prediction Button
+# -------------------------------
+if st.button("Predict Price"):
 
-    # --- Feature Engineering ---
-    # HTML date input type="date" gives YYYY-MM-DD format
-    df_input['date'] = pd.to_datetime(df_input['date'], errors='coerce', format='%Y-%m-%d') 
+    if from_city == to_city:
+        st.error("Please choose different cities.")
+        st.stop()
 
-    df_input['day'] = df_input['date'].dt.dayofweek
-    df_input['month'] = df_input['date'].dt.month
-    # Note: 'is_weekend' logic as per notebook: 1 if day_of_week is Tuesday-Sunday, 0 if Monday.
-    df_input['is_weekend'] = df_input['day'].apply(lambda x : 1 if x >= 1 else 0) 
+    # Prepare Data
+    data = pd.DataFrame({
+        "from": [from_city],
+        "to": [to_city],
+        "flightType": [flight_type],
+        "agency": [agency],
+        "time": [time],
+        "distance": [distance],
+        "date": [date]
+    })
 
-    # Calculate speed
-    # Handle division by zero for time, if time can be 0. Default to 0.
-    df_input['speed'] = df_input['distance'] / df_input['time'].replace(0, np.nan) 
-    df_input['speed'] = df_input['speed'].fillna(0) 
+    # Feature Engineering
+    data["date"] = pd.to_datetime(data["date"])
+    data["day"] = data["date"].dt.dayofweek
+    data["month"] = data["date"].dt.month
+    data["is_weekend"] = data["day"].apply(lambda x: 1 if x >= 5 else 0)
+    data["speed"] = data["distance"] / data["time"]
+    data.drop(columns=["date"], inplace=True)
 
-    # --- Robust One-Hot Encoding and Column Alignment ---
-    # Create an empty DataFrame with all EXPECTED_MODEL_COLUMNS, initialized to 0
-    processed_df = pd.DataFrame(0, index=[0], columns=EXPECTED_MODEL_COLUMNS)
+    # Encoding
+    data = pd.get_dummies(data)
+    data = data.reindex(columns=feature_columns, fill_value=0)
 
-    # Populate numerical columns directly
-    for col in NUM_COLS_SCALED:
-        if col in df_input.columns:
-            processed_df[col] = df_input[col].iloc[0]
+    # Scaling
+    num_cols = ['time', 'distance', 'day', 'month', 'is_weekend', 'speed']
+    data[num_cols] = scaler.transform(data[num_cols])
 
-    # Manually set one-hot encoded columns based on input values
-    from_val = input_dict['from']
-    if from_val != 'Aracaju (SE)': # 'Aracaju (SE)' was the alphabetically first, thus dropped during training
-        col_name = f"from_{from_val}"
-        if col_name in processed_df.columns:
-            processed_df[col_name] = 1
+    # Prediction
+    with st.spinner("Predicting flight price..."):
+        prediction = model.predict(data)[0]
 
-    to_val = input_dict['to']
-    if to_val != 'Aracaju (SE)': # 'Aracaju (SE)' was the alphabetically first of the 'to' cities, thus dropped
-        col_name = f"to_{to_val}"
-        if col_name in processed_df.columns:
-            processed_df[col_name] = 1
+    # Prepare DB Data
+    db_data = pd.DataFrame({
+        "from_city": [from_city],
+        "to_city": [to_city],
+        "flight_type": [flight_type],
+        "agency": [agency],
+        "time": [time],
+        "distance": [distance],
+        "date": [date],
+        "predicted_price": [prediction],
+        "created_at": [datetime.now()]
+    })
 
-    flight_type_val = input_dict['flightType']
-    if flight_type_val != 'economic': # 'economic' was dropped as it's alphabetically first
-        col_name = f"flightType_{flight_type_val}"
-        if col_name in processed_df.columns:
-            processed_df[col_name] = 1
-
-    agency_val = input_dict['agency']
-    if agency_val != 'CloudFy': # 'CloudFy' was dropped as it's alphabetically first
-        col_name = f"agency_{agency_val}"
-        if col_name in processed_df.columns:
-            processed_df[col_name] = 1
-
-    # --- Data Scaling ---
-    # Scale numerical features using the loaded scaler
-    # Ensure only NUM_COLS_SCALED are passed to the scaler
-    processed_df[NUM_COLS_SCALED] = scaler.transform(processed_df[NUM_COLS_SCALED])
-
-    return processed_df
-
-# --- 4. Define routes ---
-@app.route('/')
-def home():
-    # Render the HTML template for the home page, passing empty/None values initially
-    return render_template('index.html', form_data={}, predicted_price=None, error_message=None)
-
-@app.route('/predict', methods=['POST'])
-def predict():
+    # Save to PostgreSQL
     try:
-        # Get form data directly from request.form
-        form_data = request.form.to_dict() # Convert ImmutableMultiDict to a regular dict
+        with engine.begin() as conn:
+            db_data.to_sql(
+                "flight_price_predictions",
+                conn,
+                schema="public",
+                if_exists="append",
+                index=False
+            )
 
-        # Preprocess the input data
-        processed_data = preprocess_input(form_data)
+        st.success(f"💰 Predicted Flight Price: ${prediction:,.2f}")
+        st.info("✅ Data saved to PostgreSQL successfully!")
 
-        # Make prediction
-        prediction = model.predict(processed_data)[0]
-
-        # Format prediction for display
-        predicted_price = f"{prediction:.2f}"
-
-        # Render the HTML template with the prediction and original form data
-        # Pass form_data back to pre-fill the form fields
-        return render_template('index.html', predicted_price=predicted_price, form_data=form_data)
-
-    except KeyError as e:
-        # Pass form_data back on error too, so user doesn't lose input
-        return render_template('index.html', error_message=f"Missing input: {e}. Please ensure all required fields are filled.", form_data=request.form.to_dict())
-    except ValueError as e:
-        return render_template('index.html', error_message=f"Invalid data: {e}. Please check numerical entries and date format.", form_data=request.form.to_dict())
     except Exception as e:
-        return render_template('index.html', error_message=f"Prediction failed: {e}", form_data=request.form.to_dict())
+        st.warning("⚠️ Prediction done, but database is not available.")
 
-# --- 5. Run the Flask app ---
-if __name__ == '__main__':
-    # Set use_reloader=True to automatically restart the server on code changes
-    app.run(debug=True, use_reloader=True)
+# -------------------------------
+# Show Stored Data
+# -------------------------------
+st.subheader("📊 View Stored Predictions")
+
+if st.button("Show Stored Data"):
+    try:
+        query = """
+        SELECT * 
+        FROM flight_price_predictions
+        ORDER BY created_at DESC
+        LIMIT 50
+        """
+        df = pd.read_sql(query, engine)
+
+        if df.empty:
+            st.info("No data found.")
+        else:
+            st.dataframe(df)
+
+            # Download button
+            st.download_button(
+                label="⬇️ Download Data as CSV",
+                data=df.to_csv(index=False),
+                file_name="flight_price_predictions.csv",
+                mime="text/csv"
+            )
+
+    except Exception as e:
+        st.error(f"❌ Unable to fetch data: {e}")
